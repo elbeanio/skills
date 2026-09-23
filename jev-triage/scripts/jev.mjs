@@ -6,8 +6,9 @@
 // whatever full endpoint URL JEV_TRIAGE_API_BASE names. It has no code path to a chat-completions
 // endpoint, so a broadly-scoped key cannot be spent on a frontier model through this tool.
 
-import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
+import { homedir } from "node:os";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 
@@ -316,6 +317,63 @@ export function formatHunks(rows, { top = 10 } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Run log
+//
+// Opt-in, because a tool that writes to someone's home directory uninvited is a rude thing to
+// hand them. Set JEV_TRIAGE_LOG and every real run appends one JSON line: what was asked, what
+// came back, what it cost. That is the material for judging later whether this was worth using —
+// a question with its top hits is reviewable weeks afterwards in a way "it felt useful" is not.
+// ---------------------------------------------------------------------------
+
+export function resolveLogPath(env) {
+  const p = env.JEV_TRIAGE_LOG;
+  if (!p) return null;
+  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+}
+
+/**
+ * Append one run to the log. Never throws: the sweep has already been paid for, and losing its
+ * result because a log line could not be written would be an absurd trade.
+ */
+export function logRun(env, entry) {
+  const path = resolveLogPath(env);
+  if (!path) return false;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(entry)}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function readLog(path, limit = 20) {
+  const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+  const runs = [];
+  for (const l of lines) {
+    // A truncated or hand-edited line is skipped rather than aborting the report.
+    try { runs.push(JSON.parse(l)); } catch { /* ignore */ }
+  }
+  return { runs: runs.slice(-limit), total: runs.length, spend: runs.reduce((s, r) => s + (r.cost ?? 0), 0) };
+}
+
+export function formatLog({ runs, total, spend }) {
+  const out = [];
+  for (const r of runs) {
+    const when = (r.ts ?? "").replace("T", " ").slice(0, 16);
+    const where = (r.cwd ?? "").replace(homedir(), "~");
+    out.push(`${when}  ${where}`);
+    out.push(`  ${r.cmd} ${r.candidates} candidates | ${r.wall}s | $${(r.cost ?? 0).toFixed(4)}` +
+      `${r.failures ? ` | ${r.failures} unclassified` : ""}${r.bands ? ` | ${r.bands}` : ""}`);
+    if (r.question) out.push(`  "${r.question.slice(0, 96)}${r.question.length > 96 ? "…" : ""}"`);
+    for (const [label, score] of r.top ?? []) out.push(`    ${score.toFixed(2)}  ${label}`);
+    out.push("");
+  }
+  out.push(`-- ${runs.length} of ${total} runs | $${spend.toFixed(4)} spent in total`);
+  return out.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
 
@@ -450,6 +508,7 @@ USAGE
                  [--drill N] [--top N] [--all] [--json]
   jev.mjs hunks  --file F [--file F ...] (--question Q | --pattern P --subject S)
                  [--size 40] [--overlap 0.25] [--top N] [--json]
+  jev.mjs log    [--limit 20]
   jev.mjs patterns
 
 WHEN TO USE IT
@@ -477,6 +536,8 @@ ENVIRONMENT
                          https://openrouter.ai/api/alpha/decisions   (OpenRouter)
                          https://api.typesafe.ai/v1/systemone        (TypeSafe native)
   JEV_TRIAGE_MODEL     optional; default ${DEFAULT_MODEL}
+  JEV_TRIAGE_LOG       optional; append one JSON line per run here, and read it back with
+                       \`jev.mjs log\`. Nothing is recorded unless this is set.
 `;
 
 export async function main(argv = process.argv.slice(2), env = process.env, { fetchImpl } = {}) {
@@ -491,7 +552,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, { fe
     return 0;
   }
 
-  if (cmd !== "sweep" && cmd !== "hunks") {
+  if (cmd !== "sweep" && cmd !== "hunks" && cmd !== "log") {
     process.stderr.write(`unknown command '${cmd}'\n\n${HELP}`);
     return 2;
   }
@@ -507,6 +568,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, { fe
         top: { type: "string" }, all: { type: "boolean" }, json: { type: "boolean" },
         size: { type: "string" }, overlap: { type: "string" },
         drill: { type: "string" }, concurrency: { type: "string" }, "no-role": { type: "boolean" },
+        limit: { type: "string" },
       },
       allowPositionals: false,
     });
@@ -515,6 +577,19 @@ export async function main(argv = process.argv.slice(2), env = process.env, { fe
     return 2;
   }
   const a = parsed.values;
+
+  // Reading the log needs no key and no endpoint — it is a local file.
+  if (cmd === "log") {
+    const path = resolveLogPath(env);
+    if (!path) {
+      process.stderr.write("jev-triage: JEV_TRIAGE_LOG is not set, so nothing has been logged.\n\n" +
+        "  export JEV_TRIAGE_LOG=~/.jev-triage/runs.jsonl\n");
+      return 2;
+    }
+    if (!existsSync(path)) { process.stdout.write(`no runs logged yet at ${path}\n`); return 0; }
+    process.stdout.write(`${formatLog(readLog(path, a.limit ? Number(a.limit) : 20))}\n`);
+    return 0;
+  }
 
   const cfg = resolveConfig(env);
   if (cfg.error) { process.stderr.write(`jev-triage: ${cfg.error}\n`); return 2; }
@@ -585,8 +660,22 @@ export async function main(argv = process.argv.slice(2), env = process.env, { fe
     process.stdout.write(`-- ${rows.length} hunks | ${wall}s | $${cost.toFixed(4)}\n`);
   }
 
-  if (failures.length && !a.json) return 1;
-  return 0;
+  const code = failures.length && !a.json ? 1 : 0;
+  const ranked = rows.filter((r) => r.ok).sort((x, y) => y.score - x.score);
+  logRun(env, {
+    ts: new Date().toISOString(),
+    cwd: process.cwd(),
+    cmd,
+    question: questionText,
+    candidates: files.length,
+    failures: failures.length,
+    cost,
+    wall: Number(wall),
+    exit: code,
+    bands: bands(ranked.map((r) => r.score)),
+    top: ranked.slice(0, 3).map((r) => [r.label ?? `${r.file}:${r.lo}-${r.hi}`, r.score]),
+  });
+  return code;
 }
 
 // Both sides go through realpath before comparing. Skills are installed BY SYMLINK, so this

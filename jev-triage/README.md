@@ -95,6 +95,23 @@ Exit codes: `0` success, `1` completed with some candidates unclassified, `2` ba
 A malformed or unparseable response fails that one candidate and is reported as NOT CLASSIFIED —
 it never takes the rest of the sweep down with it.
 
+## Keeping a record
+
+```sh
+export JEV_TRIAGE_LOG=~/.jev-triage/runs.jsonl   # opt-in; nothing is written without it
+jev.mjs log                                      # last 20 runs, and what they cost
+jev.mjs log --limit 100
+```
+
+Each run appends one JSON line: when, where, the question, the band counts, the cost, and the
+top three results. That last part is the point — weeks later you can read a question back
+alongside the files it chose and judge whether it was right, which is not a thing you can
+reconstruct from a vague memory of it feeling useful.
+
+It is opt-in because a tool that writes to your home directory uninvited is a rude thing to hand
+someone. Log failures are swallowed: the sweep has already been paid for, and losing its result
+to a logging problem would be an absurd trade.
+
 ## What it is bad at
 
 Established by testing, not guessed:

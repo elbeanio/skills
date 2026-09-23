@@ -148,6 +148,16 @@ export JEV_TRIAGE_KEY=...
 export JEV_TRIAGE_API_BASE=https://openrouter.ai/api/alpha/decisions
 ```
 
+Optionally, keep a record of every run:
+
+```sh
+export JEV_TRIAGE_LOG=~/.jev-triage/runs.jsonl
+```
+
+One JSON line per sweep — the question, the top hits, the bands, the cost — and `"$JEV" log`
+reads it back. Nothing is recorded unless the variable is set. Worth setting: it is what lets
+you decide later whether reaching for this actually paid, rather than guessing.
+
 Mint a **dedicated** key with its own low credit limit rather than reusing a broad one. See
 `README.md` in this directory for the alternative backends.
 

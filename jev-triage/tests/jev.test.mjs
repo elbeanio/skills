@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, symlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 
 import {
   chunkLines, capState, bands, formatSweep, formatHunks, resolveConfig, resolveQuestion,
   classifyStatus, decide, mapPool, FatalApiError, PATTERNS, DEFAULT_MODEL, MAX_STATE_CHARS, hunkAdvice,
-  scoreOf, runSweep, runHunks, walk, main,
+  scoreOf, runSweep, runHunks, walk, main, logRun, readLog, formatLog, resolveLogPath,
 } from "../scripts/jev.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -625,5 +625,96 @@ describe("the CLI as a process", () => {
     } finally {
       await new Promise((r) => server.close(r));
     }
+  });
+});
+
+describe("the run log", () => {
+  // Opt-in observability: the point is being able to judge, later, whether this tool earned its
+  // place. So the log must record what was ASKED and what came BACK, not just that it ran.
+  const logPath = () => join(mkdtempSync(join(tmpdir(), "jev-log-")), "runs.jsonl");
+
+  test("records nothing unless JEV_TRIAGE_LOG is set", () => {
+    assert.equal(logRun({}, { cmd: "sweep" }), false);
+    assert.equal(resolveLogPath({}), null);
+  });
+
+  test("expands a leading ~ so a quoted path still works", () => {
+    assert.equal(resolveLogPath({ JEV_TRIAGE_LOG: "~/x/runs.jsonl" }), join(homedir(), "x/runs.jsonl"));
+    assert.equal(resolveLogPath({ JEV_TRIAGE_LOG: "/tmp/a.jsonl" }), "/tmp/a.jsonl");
+  });
+
+  test("appends one parseable line per run, creating the directory", () => {
+    const p = join(mkdtempSync(join(tmpdir(), "jev-log-")), "nested", "runs.jsonl");
+    const env = { JEV_TRIAGE_LOG: p };
+    assert.equal(logRun(env, { cmd: "sweep", cost: 0.01 }), true);
+    assert.equal(logRun(env, { cmd: "sweep", cost: 0.02 }), true);
+    const lines = readFileSync(p, "utf8").split("\n").filter(Boolean);
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.parse(lines[1]).cost, 0.02);
+  });
+
+  test("a log that cannot be written never costs the sweep", () => {
+    // The candidates have already been paid for; losing the result to a logging problem would be
+    // an absurd trade.
+    assert.equal(logRun({ JEV_TRIAGE_LOG: "/nope/definitely/not/writable/runs.jsonl" }, { cmd: "sweep" }), false);
+  });
+
+  test("reads back the last N runs, the count and the total spend", () => {
+    const p = logPath();
+    for (let i = 0; i < 5; i++) logRun({ JEV_TRIAGE_LOG: p }, { cmd: "sweep", cost: 0.01, n: i });
+    const got = readLog(p, 2);
+    assert.equal(got.total, 5);
+    assert.deepEqual(got.runs.map((r) => r.n), [3, 4], "the most recent runs, in order");
+    assert.ok(Math.abs(got.spend - 0.05) < 1e-9);
+  });
+
+  test("a corrupt line is skipped, not fatal", () => {
+    const p = logPath();
+    logRun({ JEV_TRIAGE_LOG: p }, { cmd: "sweep", cost: 0.01 });
+    writeFileSync(p, `${readFileSync(p, "utf8")}{"truncated":\n`);
+    assert.equal(readLog(p).total, 1);
+  });
+
+  test("the report shows the question and what it returned", () => {
+    const out = formatLog({
+      runs: [{ ts: "2026-09-23T19:41:02Z", cwd: "/tmp/repo", cmd: "sweep", candidates: 186,
+               failures: 1, cost: 0.0214, wall: 21.3, bands: "169 <0.05  14 0.05-0.20  0 0.20-0.45  2 >0.45",
+               question: "This file itself computes a frequency-domain transform",
+               top: [["src/analysis/extractSignals.ts", 0.58]] }],
+      total: 1, spend: 0.0214,
+    });
+    assert.match(out, /186 candidates/);
+    assert.match(out, /1 unclassified/);
+    assert.match(out, /0 0\.20-0\.45/, "the separation signal is the point of keeping these");
+    assert.match(out, /This file itself computes/);
+    assert.match(out, /0\.58 {2}src\/analysis\/extractSignals\.ts/);
+    assert.match(out, /\$0\.0214 spent in total/);
+  });
+
+  test("a sweep writes its own entry, top hits and all", async () => {
+    const p = logPath();
+    const TMP = tmpRepo({ "a.ts": "export const a = 1;\n" });
+    const r = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "does it?"],
+      { env: { ...ENV, JEV_TRIAGE_LOG: p }, fetchImpl: stub([{ status: 200 }]) });
+    assert.equal(r.code, 0);
+    const [entry] = readLog(p).runs;
+    assert.equal(entry.cmd, "sweep");
+    assert.equal(entry.question, "does it?");
+    assert.equal(entry.candidates, 1);
+    assert.equal(entry.exit, 0);
+    assert.equal(entry.top[0][1], 0.8);
+    assert.match(entry.bands, /<0\.05/);
+  });
+
+  test("`log` explains itself when the variable is unset, and needs no API config", async () => {
+    const unset = await runMain(["log"], { env: {} });
+    assert.equal(unset.code, 2);
+    assert.match(unset.err, /JEV_TRIAGE_LOG is not set/);
+
+    const p = logPath();
+    logRun({ JEV_TRIAGE_LOG: p }, { ts: "2026-09-23T19:41:02Z", cmd: "sweep", candidates: 3, cost: 0.002, wall: 1.1, top: [] });
+    const shown = await runMain(["log"], { env: { JEV_TRIAGE_LOG: p } });
+    assert.equal(shown.code, 0, "reading a local file must not require a key");
+    assert.match(shown.out, /3 candidates/);
   });
 });
