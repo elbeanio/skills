@@ -53,12 +53,33 @@ The phrasing does almost all the work. `"is this relevant?"` produces noise.
 That clause after "rather than" is what separates the two files that matter from the thirty that
 merely mention the term.
 
+**When a library does the work, "implements" is the wrong axis.** This is the most common way a
+question fails, because most code obtains things from dependencies rather than implementing them.
+If no file in the repo implements the thing — a package does — then "implements it itself" is
+honestly false everywhere, and every candidate comes back low and identical. The fix is not a
+sharper negative; it is **widening the positive to name the relationship that actually exists**:
+
+> ~~This code implements *audio spectral analysis* itself, rather than merely calling...~~
+>
+> This code itself computes a frequency-domain transform of audio, **or directly drives a Web
+> Audio AnalyserNode to obtain frequency-bin data**. Merely consuming, rendering, storing,
+> configuring, or describing already-computed spectral data does NOT count.
+
+Same repo, same files: the first put a pure consumer second and the file you wanted fourth; the
+second put the two pipeline files first and second and dropped all three lookalikes below 0.05.
+Before blaming the ranking, ask whether the thing you named is something this codebase does at
+all, or something it delegates.
+
 **Ask "what is this?", never "which came first?"** Relational questions — earliest, original, root
 cause — are unanswerable by a classifier scoring one state in isolation, because the answer lives
 outside the state.
 
-Run `"$JEV" patterns` for five ready-made shapes; use `--pattern NAME --subject "..."`
-rather than composing from scratch.
+Run `"$JEV" patterns` for five ready-made shapes; use `--pattern NAME --subject "..."` rather
+than composing from scratch.
+
+**A pattern is a starting point, not a safe default.** `implements-vs-references` has been
+observed ranking a pure consumer second, for the reason above. Check the band shape before you
+trust a pattern's output, and hand-write the question when the shape says it did not separate.
 
 ## Usage
 
@@ -92,12 +113,23 @@ rather than 400.
 
 It **ranks; it does not filter.** Read from the top and stop when it stops paying.
 
-- Band counts (`170 <0.05  13 0.05-0.20  0 0.20-0.45  2 >0.45`) show the shape. A clean gap means
-  a confident separation. **A flat distribution with no peak above ~0.6 means the question is
-  ill-posed for this codebase** — rewrite the question rather than reading harder.
+- Band counts (`170 <0.05  13 0.05-0.20  0 0.20-0.45  2 >0.45`) show the shape. **Read the gap,
+  not the top score.** An *empty middle band* — nothing in 0.20-0.45, a few above, everything else
+  at the bottom — is the confident answer. Files sitting in that middle band mean the question is
+  not separating, however respectable the top score looks.
+- A top score in the 0.5s with an empty middle is a better result than a higher peak with three
+  files in the mush. Judge the separation, not the number.
+- **If the middle band is occupied, or the distribution is flat, rewrite the question rather than
+  reading harder.** Start with whether a dependency does the work (see above).
 - The rows just below the cut are named, so a drop is visible rather than silent.
 - Anything that failed to classify is listed explicitly. **That is not the same as scoring low** —
-  never treat an absent candidate as a rejected one.
+  never treat an absent candidate as a rejected one. A file whose *contents* look like an attack
+  payload (a sanitiser, a security test, an XSS or SQL fixture) can be refused by the API's edge
+  firewall and never ranked at all, so a security-related search is where this matters most.
+- **The `role` column is a hint; the score is the verdict.** The role taxonomy has no category for
+  "drives a library that does this", so a file that orchestrates the work through a dependency is
+  labelled `consumes` even when it is exactly what you are looking for. Where they disagree,
+  believe the score.
 
 **Scores are not stable between runs.** Repeating the same sweep moved a file from 0.48 to 0.62
 and swapped the top two. What is stable is the **ordering and the gaps** — so compare candidates

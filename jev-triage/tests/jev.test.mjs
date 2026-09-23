@@ -197,10 +197,11 @@ describe("classifyStatus", () => {
     assert.notEqual(classifyStatus(403).kind, classifyStatus(429).kind);
   });
 
-  test("429 and 5xx retry; 400 does not", () => {
+  test("429 and 5xx retry; 400 and 403 do not", () => {
     assert.equal(classifyStatus(429).retry, true);
     assert.equal(classifyStatus(503).retry, true);
     assert.equal(classifyStatus(400).retry, false);
+    assert.equal(classifyStatus(403).retry, false, "a content rejection is deterministic");
   });
 });
 
@@ -247,10 +248,13 @@ describe("decide", () => {
     assert.equal(f.calls.length, 1, "a spent key must not be retried");
   });
 
-  test("gives up on a repeated 403 without throwing", async () => {
-    const r = await decide("s", {}, CFG, { fetchImpl: stub([{ status: 403 }]), retries: 2 });
+  test("a 403 fails that candidate immediately, without retrying", async () => {
+    // A content rejection is deterministic: the same body will be refused again.
+    const f = stub([{ status: 403 }]);
+    const r = await decide("s", {}, CFG, { fetchImpl: f, retries: 3 });
     assert.equal(r.ok, false);
     assert.ok(r.error.includes("403"));
+    assert.equal(f.calls.length, 1, "retrying a firewall's verdict only costs wall-clock");
   });
 
   test("a 400 is not retried", async () => {

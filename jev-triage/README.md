@@ -107,6 +107,12 @@ Established by testing, not guessed:
   in that other one" needs reasoning across candidates; do that yourself.
 - **Absence.** "Where is X *not* handled?" — a window cannot contain evidence of something that
   never happened.
+- **Files that look like an attack payload.** Every candidate's contents travel to the API as a
+  POST body, and an edge firewall inspects them: a file containing `javascript:`, an XSS or SQL
+  fixture, a CSP config or a link sanitiser can come back `403` and never be ranked. It is
+  reported as NOT CLASSIFIED rather than scored zero, but the blind spot lands precisely on
+  security-related code — often the code you were searching for. Nothing to be done about it from
+  this side; know that it happens and read those files yourself.
 - **Being right about any single file.** It is right about the *shape* of a codebase far more often
   than about one file. Scores also move between runs: a repeated sweep shifted a file from 0.48 to
   0.62 and swapped the top two. **Ordering and gaps are stable; absolute values are not.**

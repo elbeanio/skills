@@ -128,7 +128,10 @@ export function classifyStatus(status) {
   if (status === 402) return { fatal: true, kind: "credit", msg: "out of credit — the API refused the request for payment reasons" };
   if (status === 429) return { fatal: false, retry: true, kind: "throttled", msg: "throttled by the API (429)" };
   if (status >= 500) return { fatal: false, retry: true, kind: "server", msg: `server error (${status})` };
-  if (status === 403) return { fatal: false, retry: true, kind: "forbidden", msg: "forbidden (403) — often a WAF rejecting the content" };
+  // Not retried: a 403 here is almost always an edge firewall objecting to the CONTENT of this
+  // candidate — a sanitiser, a security test, an XSS fixture. That verdict is deterministic, so
+  // three attempts and their backoff arrive at the same answer more slowly.
+  if (status === 403) return { fatal: false, retry: false, kind: "forbidden", msg: "forbidden (403) — an edge firewall rejected this content; it will not pass on a retry" };
   return { fatal: false, retry: false, kind: "http", msg: `HTTP ${status}` };
 }
 
