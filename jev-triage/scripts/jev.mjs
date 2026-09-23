@@ -6,7 +6,7 @@
 // whatever full endpoint URL JEV_TRIAGE_API_BASE names. It has no code path to a chat-completions
 // endpoint, so a broadly-scoped key cannot be spent on a frontier model through this tool.
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -586,7 +586,15 @@ export async function main(argv = process.argv.slice(2), env = process.env, { fe
   return 0;
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// Both sides go through realpath before comparing. Skills are installed BY SYMLINK, so this
+// file is normally reached through one — and Node reports import.meta.url as the resolved real
+// path while argv[1] keeps the symlink it was invoked by. Comparing them raw means main() never
+// runs: no output, no error, exit 0. Silent success is the worst failure available here.
+const entry = process.argv[1];
+let isMain = false;
+try {
+  isMain = !!entry && realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+} catch { /* argv[1] gone or unreadable: treat as imported, not run */ }
 if (isMain) {
   main().then((c) => process.exit(c)).catch((e) => { process.stderr.write(`jev-triage: ${e.stack}\n`); process.exit(3); });
 }

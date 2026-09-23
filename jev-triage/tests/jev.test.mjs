@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, symlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 import { tmpdir } from "node:os";
@@ -575,6 +575,23 @@ describe("walk", () => {
 });
 
 describe("the CLI as a process", () => {
+  test("runs when invoked through a symlink, the way skills are installed", async () => {
+    // Regression: the entrypoint guard compared argv[1] to import.meta.url raw. Through a
+    // symlink those differ, so the CLI exited 0 having printed nothing — and since install.sh
+    // installs by symlink, that was every real invocation.
+    const dir = mkdtempSync(join(tmpdir(), "jev-link-"));
+    const link = join(dir, "jev.mjs");
+    symlinkSync(join(HERE, "..", "scripts", "jev.mjs"), link);
+
+    const child = spawn(process.execPath, [link, "patterns"]);
+    const out = [];
+    child.stdout.on("data", (c) => out.push(c));
+    const code = await new Promise((r) => child.on("close", r));
+    assert.equal(code, 0);
+    assert.match(Buffer.concat(out).toString(), /implements-vs-references/,
+      "a symlinked entrypoint must still run main()");
+  });
+
   // The one path main() cannot be handed directly: stdin. Worth a real child process and a real
   // socket, because `grep -rl … | jev.mjs sweep --files -` is the documented entry point.
   test("reads candidates from stdin and exits 0", async () => {
