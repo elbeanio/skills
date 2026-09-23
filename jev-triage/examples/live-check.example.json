@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Copy to something.local.json (gitignored) and edit. Establish the expectations by READING",
+    "the code first — ground truth copied from the tool's own output proves nothing."
+  ],
+  "repo": "../some-repo",
+  "src": "src",
+  "ext": [".ts", ".tsx"],
+  "question": "This file contains code that itself computes a frequency-domain transform of audio (an FFT, DFT, or equivalent spectral analysis). Merely consuming, rendering, storing, configuring, or describing already-computed spectral data does NOT count.",
+  "expect_top": ["src/analysis/pipeline.ts", "src/analysis/extract.ts"],
+  "expect_below": {
+    "score": 0.05,
+    "files": ["src/render/spectrograph.ts", "src/util/dsp.ts"]
+  },
+  "expect_hunk": {
+    "file": "src/analysis/extract.ts",
+    "contains": "Meyda.extract("
+  }
+}

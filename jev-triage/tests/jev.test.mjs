@@ -1,12 +1,16 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 
 import {
   chunkLines, capState, bands, formatSweep, formatHunks, resolveConfig, resolveQuestion,
   classifyStatus, decide, mapPool, FatalApiError, PATTERNS, DEFAULT_MODEL, MAX_STATE_CHARS, hunkAdvice,
+  scoreOf, runSweep, runHunks, walk, main,
 } from "../scripts/jev.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -337,5 +341,268 @@ describe("hunkAdvice", () => {
 
   test("does not fire on a file with too few hunks to judge", () => {
     assert.deepEqual(hunkAdvice(mk("d.ts", [0.9, 0.8]), ["d.ts"]), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Orchestration and CLI.
+//
+// These were the untested half: every crash and every wrong exit code the review found lived
+// below the pure functions above. The seam is `fetchImpl`, threaded from main() down to
+// decide(), so nothing here touches the network or a global.
+// ---------------------------------------------------------------------------
+
+const ENV = { JEV_TRIAGE_KEY: "k", JEV_TRIAGE_API_BASE: "https://x" };
+
+/** Run main() with stdout/stderr captured, so an exit code can be asserted without a child. */
+async function runMain(argv, { env = ENV, fetchImpl } = {}) {
+  const out = [], err = [];
+  const so = process.stdout.write.bind(process.stdout);
+  const se = process.stderr.write.bind(process.stderr);
+  process.stdout.write = (s) => { out.push(String(s)); return true; };
+  process.stderr.write = (s) => { err.push(String(s)); return true; };
+  try {
+    const code = await main(argv, env, { fetchImpl });
+    return { code, out: out.join(""), err: err.join("") };
+  } finally {
+    process.stdout.write = so;
+    process.stderr.write = se;
+  }
+}
+
+function tmpRepo(files) {
+  const dir = mkdtempSync(join(tmpdir(), "jev-test-"));
+  for (const [name, body] of Object.entries(files)) {
+    const p = join(dir, name);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, body);
+  }
+  return dir;
+}
+
+describe("scoreOf", () => {
+  test("extracts a finite score", () => {
+    assert.equal(scoreOf({ hit: { noul: 0.42 } }), 0.42);
+    assert.equal(scoreOf({ hit: { noul: 0 } }), 0, "zero is a real score, not a missing one");
+  });
+
+  test("rejects every shape that is not a usable number", () => {
+    for (const bad of [undefined, null, {}, { hit: {} }, { hit: { noul: "0.4" } }, { hit: { noul: NaN } }]) {
+      assert.equal(scoreOf(bad), null, `${JSON.stringify(bad)} must not be treated as a score`);
+    }
+  });
+});
+
+describe("runSweep error paths", () => {
+  const TMP = tmpRepo({ "a.ts": "export const a = 1;\n", "b.ts": "export const b = 2;\n" });
+  const files = [join(TMP, "a.ts"), join(TMP, "b.ts")];
+
+  test("a malformed response fails one candidate, never the whole sweep", async () => {
+    // The bug this replaced: an unguarded r.answers.hit.noul threw out of mapPool's Promise.all,
+    // discarding every other row — including ones already paid for.
+    let n = 0;
+    const fetchImpl = async () => {
+      const body = n++ === 0 ? { unexpected: true } : okBody;
+      return { ok: true, status: 200, json: async () => body };
+    };
+    const { rows } = await runSweep(files, "q", CFG, { concurrency: 1, fetchImpl });
+    assert.equal(rows.filter((r) => r.ok).length, 1, "the good candidate must survive");
+    assert.equal(rows.find((r) => !r.ok).error, "unexpected response shape");
+  });
+
+  test("an unparseable body is reported, not thrown", async () => {
+    const fetchImpl = async () => ({
+      ok: true, status: 200,
+      json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+    });
+    const { rows } = await runSweep(files, "q", CFG, { concurrency: 2, fetchImpl });
+    assert.equal(rows.filter((r) => r.ok).length, 0);
+    assert.ok(rows.every((r) => r.error === "unparseable response body"));
+  });
+
+  test("an unreadable file is one failed row", async () => {
+    const { rows } = await runSweep([join(TMP, "gone.ts")], "q", CFG,
+      { concurrency: 1, fetchImpl: stub([{ status: 200 }]) });
+    assert.equal(rows[0].ok, false);
+    assert.match(rows[0].error, /unreadable: ENOENT/);
+  });
+
+  test("a fatal status still aborts the run", async () => {
+    await assert.rejects(
+      () => runSweep(files, "q", CFG, { concurrency: 1, fetchImpl: stub([{ status: 401 }]) }),
+      FatalApiError,
+      "a bad key would fail every candidate; reporting them one by one buries the cause",
+    );
+  });
+
+  test("runHunks guards the same shape", async () => {
+    const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ answers: {} }) });
+    const { rows } = await runHunks([join(TMP, "a.ts")], "q", CFG,
+      { concurrency: 1, size: 40, overlap: 0.25, fetchImpl });
+    assert.ok(rows.length > 0);
+    assert.ok(rows.every((r) => !r.ok && r.error === "unexpected response shape"));
+  });
+});
+
+describe("main exit codes", () => {
+  // The README documents these as a contract. Before this suite nothing enforced them.
+  const TMP = tmpRepo({ "src/a.ts": "export const a = 1;\n" });
+
+  test("0 when every candidate classifies", async () => {
+    const r = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q"],
+      { fetchImpl: stub([{ status: 200 }]) });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /a\.ts/);
+  });
+
+  test("1 when the run completed but something did not classify", async () => {
+    const r = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q"],
+      { fetchImpl: stub([{ status: 400 }]) });
+    assert.equal(r.code, 1);
+    assert.match(r.out, /NOT CLASSIFIED/);
+    assert.match(r.out, /absence here is not a low score/);
+  });
+
+  test("2 when configuration is missing, and the key is never echoed", async () => {
+    const r = await runMain(["sweep", "--dir", TMP, "--question", "q"], { env: {} });
+    assert.equal(r.code, 2);
+    assert.match(r.err, /JEV_TRIAGE_KEY/);
+    assert.ok(!r.err.includes("secret-key"));
+  });
+
+  test("2 on an empty candidate set — usage, not a partial result", async () => {
+    const empty = tmpRepo({});
+    const r = await runMain(["sweep", "--dir", empty, "--ext", ".ts", "--question", "q"],
+      { fetchImpl: stub([{ status: 200 }]) });
+    assert.equal(r.code, 2, "1 means 'completed with failures'; an empty sweep completed nothing");
+  });
+
+  test("2 on bad usage", async () => {
+    assert.equal((await runMain(["frobnicate"])).code, 2);
+    assert.equal((await runMain(["sweep", "--dir", TMP])).code, 2, "no question");
+    assert.equal((await runMain(["hunks", "--question", "q"])).code, 2, "no --file");
+    assert.equal((await runMain(["sweep", "--dir", TMP, "--pattern", "nope", "--subject", "s"])).code, 2);
+  });
+
+  test("3 on a fatal API error", async () => {
+    const r = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q"],
+      { fetchImpl: stub([{ status: 402 }]) });
+    assert.equal(r.code, 3);
+    assert.match(r.err, /out of credit/);
+  });
+
+  test("help and patterns are always 0", async () => {
+    assert.equal((await runMain([])).code, 0);
+    assert.equal((await runMain(["--help"])).code, 0);
+    const p = await runMain(["patterns"]);
+    assert.equal(p.code, 0);
+    assert.match(p.out, /implements-vs-references/);
+  });
+});
+
+describe("main CLI surface", () => {
+  const TMP = tmpRepo({
+    "src/a.ts": Array.from({ length: 90 }, (_, i) => `const x${i} = ${i};\n`).join(""),
+    "src/b.ts": "export const b = 2;\n",
+  });
+
+  test("--json emits a parseable document rather than the table", async () => {
+    const r = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q", "--json"],
+      { fetchImpl: stub([{ status: 200 }]) });
+    const doc = JSON.parse(r.out);
+    assert.equal(doc.question, "q");
+    assert.equal(doc.rows.length, 2);
+    assert.equal(doc.failures, 0);
+    assert.ok(typeof doc.cost === "number");
+  });
+
+  test("--json returns 0 even with failures, because the caller can see them", async () => {
+    const r = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q", "--json"],
+      { fetchImpl: stub([{ status: 400 }]) });
+    assert.equal(r.code, 0);
+    assert.equal(JSON.parse(r.out).failures, 2);
+  });
+
+  test("--drill runs a second pass and prints runnable sed commands", async () => {
+    const r = await runMain(
+      ["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q", "--drill", "1"],
+      { fetchImpl: stub([{ status: 200 }]) });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /pass 2: hunks within the top 1/);
+    assert.match(r.out, /sed -n '\d+,\d+p'/);
+  });
+
+  test("--top and --all control how much of the ranking is shown", async () => {
+    const one = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q", "--top", "1"],
+      { fetchImpl: stub([{ status: 200 }]) });
+    assert.match(one.out, /next below the cut/, "a hidden row must still be named");
+    const all = await runMain(["sweep", "--dir", TMP, "--ext", ".ts", "--question", "q", "--all"],
+      { fetchImpl: stub([{ status: 200 }]) });
+    assert.ok(!/next below the cut/.test(all.out), "nothing is below the cut when everything is shown");
+  });
+
+  test("hunks reports which file could not be localised", async () => {
+    const r = await runMain(
+      ["hunks", "--file", join(TMP, "src/a.ts"), "--question", "q"],
+      { fetchImpl: stub([{ status: 200, body: { answers: { hit: { noul: 0.01 } }, usage: {} } }]) });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /no hunk localised/);
+  });
+});
+
+describe("walk", () => {
+  const TMP = tmpRepo({
+    "src/a.ts": "a", "src/deep/b.tsx": "b", "src/c.js": "c",
+    "node_modules/pkg/d.ts": "d", "dist/e.ts": "e", ".hidden/f.ts": "f",
+  });
+
+  test("filters by extension and returns sorted paths", () => {
+    const got = walk(TMP, [".ts", ".tsx"]).map((p) => relative(TMP, p));
+    assert.deepEqual(got, [join("src", "a.ts"), join("src", "deep", "b.tsx")]);
+  });
+
+  test("skips build and vendor directories, and dotted ones", () => {
+    const all = walk(TMP, []).map((p) => relative(TMP, p));
+    assert.ok(!all.some((p) => p.includes("node_modules")), "node_modules must never be swept");
+    assert.ok(!all.some((p) => p.includes("dist")), "build output is not source");
+    assert.ok(!all.some((p) => p.includes(".hidden")), "dotted directories are skipped");
+    assert.ok(all.includes(join("src", "c.js")), "an empty extension list means every file");
+  });
+
+  test("a missing directory is empty, not a throw", () => {
+    assert.deepEqual(walk(join(TMP, "nope"), [".ts"]), []);
+  });
+});
+
+describe("the CLI as a process", () => {
+  // The one path main() cannot be handed directly: stdin. Worth a real child process and a real
+  // socket, because `grep -rl … | jev.mjs sweep --files -` is the documented entry point.
+  test("reads candidates from stdin and exits 0", async () => {
+    const server = createServer((req, res) => {
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(okBody));
+      });
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const port = server.address().port;
+    const TMP = tmpRepo({ "a.ts": "export const a = 1;\n" });
+
+    try {
+      const child = spawn(process.execPath, [join(HERE, "..", "scripts", "jev.mjs"),
+        "sweep", "--files", "-", "--question", "q"], {
+        env: { ...process.env, JEV_TRIAGE_KEY: "k", JEV_TRIAGE_API_BASE: `http://127.0.0.1:${port}` },
+      });
+      const out = [];
+      child.stdout.on("data", (c) => out.push(c));
+      child.stdin.end(`${join(TMP, "a.ts")}\n`);
+      const code = await new Promise((r) => child.on("close", r));
+      assert.equal(code, 0);
+      assert.match(Buffer.concat(out).toString(), /a\.ts/);
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
   });
 });

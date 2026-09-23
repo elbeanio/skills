@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  jev-triage:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the floor the README promises; 22 is current LTS. The suite is offline, so no
+        # key or network access is needed here.
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # Unquoted so the shell expands it: Node 20 cannot expand a glob, and Node 24+ will not
+      # search a bare directory. Shell expansion is the form that works on both.
+      - run: node --test tests/*.test.mjs
+        working-directory: jev-triage

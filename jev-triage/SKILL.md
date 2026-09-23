@@ -11,6 +11,16 @@ Each call costs a fraction of a cent and the whole sweep takes seconds.
 The point is not that the decision is cheaper — it is that **looking is cheaper**. Context is the
 scarce resource. This lets you examine 200 files without any of them entering your context.
 
+## What leaves your machine
+
+**Every candidate's full contents are uploaded to a third-party API** — one request per file, or
+per hunk. That is how the ranking happens; there is no local mode.
+
+Before sweeping anything, check that sending it to an external service is acceptable: a private
+or client codebase, anything under an NDA, a repo holding credentials or personal data. This is a
+question about the *content*, and it is separate from — and more important than — the question of
+which key you use.
+
 ## When to use it
 
 Both conditions, together:
@@ -47,24 +57,32 @@ merely mention the term.
 cause — are unanswerable by a classifier scoring one state in isolation, because the answer lives
 outside the state.
 
-Run `scripts/jev.mjs patterns` for five ready-made shapes; use `--pattern NAME --subject "..."`
+Run `"$JEV" patterns` for five ready-made shapes; use `--pattern NAME --subject "..."`
 rather than composing from scratch.
 
 ## Usage
 
+The script lives inside this skill's own directory, and you will be running it from somewhere
+else — so invoke it by absolute path. Set it once:
+
+```sh
+JEV=~/.claude/skills/jev-triage/scripts/jev.mjs   # or ~/.pi/agent/skills/jev-triage/..., or
+                                                  # <project>/.claude/skills/jev-triage/...
+```
+
 ```sh
 # sweep a tree
-scripts/jev.mjs sweep --dir src --ext .ts,.tsx \
+"$JEV" sweep --dir src --ext .ts,.tsx \
   --pattern implements-vs-references --subject "audio spectral analysis"
 
 # sweep specific candidates (e.g. grep output)
-grep -rl spectral src | scripts/jev.mjs sweep --files - --question "..."
+grep -rl spectral src | "$JEV" sweep --files - --question "..."
 
 # sweep, then localise within the top 5 — output is line-anchored
-scripts/jev.mjs sweep --dir src --ext .ts --question "..." --drill 5
+"$JEV" sweep --dir src --ext .ts --question "..." --drill 5
 
 # rank hunks within known files
-scripts/jev.mjs hunks --file src/analysis/extractSignals.ts --question "..."
+"$JEV" hunks --file src/analysis/extractSignals.ts --question "..."
 ```
 
 `--drill` and `hunks` print a ready-to-run `sed -n 'lo,hip' file` per result, so you read 40 lines
@@ -91,6 +109,8 @@ than it is right about any single file.
 
 ## Setup
 
+Needs Node 20 or newer, and two environment variables:
+
 ```sh
 export JEV_TRIAGE_KEY=...
 export JEV_TRIAGE_API_BASE=https://openrouter.ai/api/alpha/decisions
@@ -98,3 +118,6 @@ export JEV_TRIAGE_API_BASE=https://openrouter.ai/api/alpha/decisions
 
 Mint a **dedicated** key with its own low credit limit rather than reusing a broad one. See
 `README.md` in this directory for the alternative backends.
+
+Exit codes: `0` success, `1` completed with some candidates unclassified, `2` bad usage or
+config (including an empty candidate set), `3` fatal API error.

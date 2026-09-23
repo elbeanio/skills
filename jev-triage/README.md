@@ -2,12 +2,14 @@
 
 A context firewall for coding agents.
 
-Ask one precise question about every file in a repo, concurrently, for about two pence. Read the
-six that survive instead of the sixty that matched a grep.
+Ask one precise question about every file in a repo, concurrently, for pennies. Read the six that
+survive instead of the sixty that matched a grep.
 
 It wraps [Jev](https://pi.dev) — TypeSafe's "System One" decision model — which returns typed
-values and calibrated probabilities rather than prose. One skill directory, working in both
-**Claude Code** and **Pi**.
+values and calibrated probabilities rather than prose. One skill directory, working in any agent
+that reads `SKILL.md` — **Claude Code** and **Pi** are both tested.
+
+Needs Node 20 or newer, and an API key.
 
 ## Why
 
@@ -15,36 +17,44 @@ The bottleneck in agent work isn't making decisions; it's *looking at things*. E
 costs context, and context is what forces subagent fan-out and degrades long sessions. Today,
 deciding whether a file is worth reading requires reading it.
 
-Measured on a real 186-file TypeScript repo, asking "where is spectral analysis computed?":
+Run against a real TypeScript repo, asking "where is spectral analysis computed?", it returned
+two files where a grep returned dozens — in seconds, for a couple of pence. More usefully it
+stepped over all three traps the grep fell into: two files *named* after spectra that only render
+them, and a file named `dsp.ts` that merely consumes a spectrum computed elsewhere.
 
-| | wall | cost | files read |
-|---|---|---|---|
-| `grep` + read the plausible ones | minutes | — | 43 candidates, 36 of them wasted |
-| `jev-triage sweep` | **3.8s** | **$0.021** | 2 |
-
-It also stepped over all three traps a grep falls into — two files *named* after spectra that only
-render them, and a file named `dsp.ts` that merely consumes a spectrum computed elsewhere.
+(Those runs were against a private repo, so the figures are not reproducible here and are
+deliberately left vague. `examples/live-check.mjs` is how you establish the same thing on a
+codebase you know.)
 
 ## Install
 
+The repo-root installer symlinks every skill into the agents it finds:
+
 ```sh
 git clone https://github.com/elbeanio/skills.git
-sh skills/jev-triage/install.sh          # symlinks into ~/.claude/skills/ and ~/.pi/agent/skills/
-sh skills/jev-triage/install.sh --check  # verify
+sh skills/install.sh          # symlink all skills into the agents installed here
+sh skills/install.sh --check  # verify
 ```
 
-Symlinks, so a `git pull` updates both harnesses and there's no copy to drift. To install by hand
-like the other skills in this repo, link the folder into whichever harness you use:
+Or link this one by hand, into whichever agent you use:
 
 ```sh
 ln -s "$PWD/skills/jev-triage" ~/.claude/skills/jev-triage
 ln -s "$PWD/skills/jev-triage" ~/.pi/agent/skills/jev-triage
 ```
 
+Symlinks, so a `git pull` updates every agent at once and there's no copy to drift.
+
 ```sh
 export JEV_TRIAGE_KEY=...
 export JEV_TRIAGE_API_BASE=https://openrouter.ai/api/alpha/decisions
 ```
+
+### What you are sending, and to whom
+
+**Every file it sweeps is uploaded in full to a third-party API.** There is no local mode. Decide
+whether that is acceptable for a given repo *before* pointing it at one — private or client code,
+anything under an NDA, anything holding credentials or personal data.
 
 **Mint a dedicated key with its own low credit limit.** An OpenRouter key carries access to every
 model on the platform; this tool only ever issues the decisions request shape and has no code path
@@ -79,8 +89,11 @@ jev.mjs sweep --dir src --ext .ts --question "..." --drill 5
 `--drill` and `hunks` print a ready-to-run `sed -n 'lo,hip' file` per result, so you read 40 lines
 instead of 400.
 
-Exit codes: `0` success, `1` completed with some candidates unclassified, `2` bad usage or config,
-`3` fatal API error (auth, credit).
+Exit codes: `0` success, `1` completed with some candidates unclassified, `2` bad usage or config
+(including an empty candidate set), `3` fatal API error (auth, credit).
+
+A malformed or unparseable response fails that one candidate and is reported as NOT CLASSIFIED —
+it never takes the rest of the sweep down with it.
 
 ## What it is bad at
 
@@ -104,14 +117,30 @@ your accuracy.
 
 ## Tests
 
-Run from inside `jev-triage/`:
-
 ```sh
-node --test 'tests/*.test.mjs'                      # offline, no key needed — the commit gate
-AUDIOVIZ=path/to/repo node tests/live_smoke.mjs     # live regression against known ground truth
+node --test tests/*.test.mjs    # from inside jev-triage/ — offline, no key, the commit gate
 ```
 
-The live smoke test encodes ground truth established by hand: the two pipeline files rank top-2,
-all three grep traps stay below 0.05, the top hunk contains the known call site, and a consuming
-file stays flat as a negative control. **Don't relax those to make a change pass.** It is written
-against a specific repo, so it is a regression test for the author rather than a general suite.
+No network and no key: the HTTP call is injected, so the suite covers the orchestration and the
+CLI as well as the pure functions — including that a malformed response costs one candidate
+rather than the run, and that the exit codes above are what they say they are. CI runs exactly
+this on Node 20 and 22.
+
+(Unquoted: the shell expands the glob. Node 20 cannot expand one itself, and Node 24+ no longer
+searches a bare directory, so letting the shell do it is the form that works on both.)
+
+### Checking the ranking on real code
+
+The offline suite proves the plumbing, not the quality of the ranking. For that, point
+`examples/live-check.mjs` at a repo you know well:
+
+```sh
+cp examples/live-check.example.json mine.local.json   # edit: repo, question, expectations
+node examples/live-check.mjs --config mine.local.json
+node examples/live-check.mjs --config mine.local.json --repo ../other-repo
+```
+
+It needs a key and spends real money, so it is a hand-run check rather than a gate. **Establish
+the expectations by reading the code first** — ground truth copied from the tool's own output
+proves only that the tool agrees with itself — and don't relax them to make a change pass. Configs
+matching `*.local.json` are gitignored, because they name repos only you have.

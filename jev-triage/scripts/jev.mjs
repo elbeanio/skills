@@ -16,7 +16,10 @@ export const DEFAULT_MODEL = "typesafe/jev-1.13";
 // Chunking defaults to the 32k-context floor (OpenRouter) so it is safe on either backend.
 // TypeSafe native allows 64k; that headroom is deliberately left unused rather than guessed at
 // from the URL.
-export const MAX_STATE_CHARS = 110_000;
+//
+// Source tokenises far denser than prose — roughly 3-3.5 chars/token against prose's ~4 — so the
+// earlier 110k cap implied ~32-36k tokens and could overshoot the very window it was sized for.
+export const MAX_STATE_CHARS = 90_000;
 export const HUNK_LINES = 40;
 export const HUNK_OVERLAP = 0.25;
 export const CONCURRENCY = 40;
@@ -150,8 +153,11 @@ export async function decide(state, questions, cfg, { fetchImpl = fetch, retries
       return { ok: false, error: lastMsg };
     }
     if (res.ok) {
-      const json = await res.json();
-      return { ok: true, answers: json.answers, usage: json.usage ?? {}, throttled };
+      // A 200 is not a promise of JSON: a proxy or WAF can return an HTML interstitial with a
+      // success status. Failing this candidate beats throwing out of the whole pool.
+      let json;
+      try { json = await res.json(); } catch { return { ok: false, error: "unparseable response body", throttled }; }
+      return { ok: true, answers: json?.answers, usage: json?.usage ?? {}, throttled };
     }
     const c = classifyStatus(res.status);
     if (c.fatal) throw new FatalApiError(c.msg, c.kind);
@@ -371,6 +377,18 @@ function questionsFor(text, withRole) {
   return q;
 }
 
+/**
+ * Pull the score out of a response, or say why it could not be used.
+ *
+ * The shape is the backend's to change, and one unexpected body must never cost the whole run:
+ * every candidate here has already been paid for. A bad shape fails one row, like any other
+ * per-candidate error, and is reported as NOT CLASSIFIED rather than as a low score.
+ */
+export function scoreOf(answers) {
+  const v = answers?.hit?.noul;
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
 export async function runSweep(files, questionText, cfg, opts) {
   const qs = questionsFor(questionText, !opts.noRole);
   let throttled = false;
@@ -378,13 +396,15 @@ export async function runSweep(files, questionText, cfg, opts) {
     let raw;
     try { raw = readFileSync(file, "utf8"); } catch (e) { return { ok: false, label: file, error: `unreadable: ${e.code ?? e.message}` }; }
     const { text } = capState(`${file}\n\n${raw}`);
-    const r = await decide(text, qs, cfg);
+    const r = await decide(text, qs, cfg, { fetchImpl: opts.fetchImpl });
     if (r.throttled) throttled = true;
     if (!r.ok) return { ok: false, label: file, error: r.error };
+    const score = scoreOf(r.answers);
+    if (score === null) return { ok: false, label: file, error: "unexpected response shape" };
     return {
       ok: true,
       label: file,
-      score: r.answers.hit.noul,
+      score,
       role: r.answers.role?.choice,
       conf: r.answers.role?.confidence,
       cost: r.usage.cost ?? 0,
@@ -407,10 +427,12 @@ export async function runHunks(files, questionText, cfg, opts) {
   let throttled = false;
   const rows = await mapPool(jobs, opts.concurrency, async (j) => {
     const { text } = capState(`${j.file} lines ${j.lo}-${j.hi}:\n\n${j.text}`);
-    const r = await decide(text, qs, cfg);
+    const r = await decide(text, qs, cfg, { fetchImpl: opts.fetchImpl });
     if (r.throttled) throttled = true;
     if (!r.ok) return { ok: false, label: `${j.file}:${j.lo}-${j.hi}`, error: r.error };
-    return { ok: true, file: j.file, lo: j.lo, hi: j.hi, score: r.answers.hit.noul, cost: r.usage.cost ?? 0 };
+    const score = scoreOf(r.answers);
+    if (score === null) return { ok: false, label: `${j.file}:${j.lo}-${j.hi}`, error: "unexpected response shape" };
+    return { ok: true, file: j.file, lo: j.lo, hi: j.hi, score, cost: r.usage.cost ?? 0 };
   });
   return { rows, throttled };
 }
@@ -454,7 +476,7 @@ ENVIRONMENT
   JEV_TRIAGE_MODEL     optional; default ${DEFAULT_MODEL}
 `;
 
-export async function main(argv = process.argv.slice(2), env = process.env) {
+export async function main(argv = process.argv.slice(2), env = process.env, { fetchImpl } = {}) {
   const cmd = argv[0];
   if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") { process.stdout.write(HELP); return 0; }
 
@@ -504,6 +526,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     overlap: a.overlap ? Number(a.overlap) : HUNK_OVERLAP,
     concurrency: a.concurrency ? Number(a.concurrency) : CONCURRENCY,
     noRole: !!a["no-role"],
+    fetchImpl,
   };
 
   let files = [];
@@ -517,7 +540,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     const exts = a.ext ? a.ext.split(",").map((s) => s.trim()).filter(Boolean) : [];
     files = walk(root, exts);
   }
-  if (!files.length) { process.stderr.write(`jev-triage: no candidates\n`); return 1; }
+  // Usage, not a partial result: 1 is reserved for a run that completed with some candidates
+  // unclassified, and conflating the two makes the documented exit codes meaningless.
+  if (!files.length) { process.stderr.write(`jev-triage: no candidates\n`); return 2; }
 
   const t0 = Date.now();
   let result;
@@ -526,7 +551,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       ? await runSweep(files, questionText, cfg, opts)
       : await runHunks(files, questionText, cfg, opts);
   } catch (e) {
-    if (e instanceof FatalApiError) { process.stderr.write(`jev-triage: ${e.msg ?? e.message}\n`); return 3; }
+    if (e instanceof FatalApiError) { process.stderr.write(`jev-triage: ${e.message}\n`); return 3; }
     throw e;
   }
 

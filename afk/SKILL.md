@@ -57,8 +57,8 @@ A prompt nobody is there to answer blocks the run completely, so forecast these 
 
 **Name the actual calls.** "I might need some permissions" is not a forecast. Then ask them
 either to approve those specific ones, or — if the list is long or you can't fully predict it —
-say plainly that accept-edits or bypass-permissions mode suits this window better, and let them
-choose. Their call, not yours.
+say plainly that a more permissive approval mode suits this window better (in Claude Code,
+accept-edits or bypass-permissions), and let them choose. Their call, not yours.
 
 ## 3. Ask, once
 

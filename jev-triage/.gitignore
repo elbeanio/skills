@@ -1,0 +1,2 @@
+# Local live-check configs point at repos only you have
+examples/*.local.json
